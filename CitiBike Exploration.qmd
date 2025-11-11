@@ -1,0 +1,476 @@
+---
+title: "Citi Bike Rebalancing & Station Exploration"
+author:
+  - name: Nam Ha
+date: last-modified
+date-format: long
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-link: true
+    theme:
+      light: flatly
+      dark: darkly
+    embed-resources: true
+execute:
+  eval: true
+  warning: false
+  message: false
+  error: false
+  echo: true
+---
+
+
+
+```{r}
+library(tidyverse) # the usual
+library(sf)        # for map data
+library(patchwork) # for organizing multiple graphs
+library(ggthemes)  # collection of graph themes
+theme_set(theme_tufte(base_family = 'sans'))
+```
+
+
+
+```{r}
+rider_trips <- read_csv('data/201909-citibike-tripdata.csv')
+rider_trips <- 
+  rider_trips |> 
+  rename_all(function(x) gsub(' ', '_', x)) |>
+  rename(start_time = starttime,
+         end_time = stoptime) |>
+  mutate(tripduration = as.difftime(tripduration / 3600, units = 'hours') )
+```
+
+
+
+
+
+# Measuring CitiBike interventions (data transformations)
+
+```{r}
+
+# ENTER CODE TO TRANSFORM DATA INTO interventions
+interventions <- rider_trips |>
+  select( -birth_year, -gender ) |>
+  arrange(bikeid, start_time) |>
+  group_by(bikeid) |>
+   mutate(
+    across(
+      .cols = matches('end_'),
+      .fns = lag
+    )
+  ) |>
+  rename_with(
+    .cols = contains('time') | contains('_station_'),
+    ~ if_else(
+        str_detect(., 'start'),
+        str_replace(., 'start', 'end'),
+        str_replace(., 'end', 'start')
+      )
+  ) |>
+  filter(
+    !is.na(start_station_name),
+    start_station_name != end_station_name
+  ) |>
+  ungroup() |>
+  mutate(
+    usertype = 'Citi Bike',
+    tripduration = as.numeric(difftime(end_time, start_time, units = "hours"))
+  )
+glimpse(interventions)
+names(interventions)
+summary(interventions$tripduration)
+table(interventions$usertype)
+
+```
+
+
+
+
+```{r}
+#using the rider_trips dataset for human activity with Citi Bike
+#each row = 1 station; num_trips = number of trips that started there
+station_counts <- rider_trips |>
+  group_by(start_station_id, start_station_name) |>
+  summarise(num_trips = n(), .groups = "drop")
+
+#extract info for station 379
+msg_station <- station_counts |>
+  filter(start_station_id == 379)
+
+#compute percentage of stations with more rides leaving than 379
+percent_more_rides <- mean(station_counts$num_trips > msg_station$num_trips) * 100
+
+
+print(percent_more_rides)
+```
+
+
+
+
+```{r}
+#count interventions by origin station using the interventions datatset
+intervention_removals <- interventions |>
+  group_by(start_station_id, start_station_name) |>
+  summarise(num_removed = n(), .groups = "drop")
+
+#extract info for station 379
+msg_removals <- intervention_removals |>
+  filter(start_station_id == 379)
+
+#compute the percentage of stations with more removal than 379
+percent_more_removed <- mean(intervention_removals$num_removed > msg_removals$num_removed) * 100
+
+print(percent_more_removed)
+```
+
+
+
+
+
+```{r}
+library(ggplot2)
+
+ggplot(intervention_removals, aes(x = num_removed)) +
+  geom_histogram(binwidth = 40, fill = "#2C7BB6", color = "white", boundary = 0) +
+  scale_x_continuous(limits = c(0, 2000)) +
+  labs(
+    title = "Most Stations See Few Removals — A Small Number Drive Citi Bike’s Rebalancing Effort",
+    x = "Number of Bikes Removed (per station)",
+    y = "Count of Stations"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+
+
+
+
+```{r}
+ggplot(interventions, aes(x = tripduration)) +
+  geom_histogram(binwidth = 5, fill = "#3182bd", color = "white", boundary = 0) +
+  geom_vline(xintercept = 24, color = "red", size = 1, linetype = "dashed") +
+  annotate("text", x = 26, y = Inf, vjust = 1.5, label = "24 hours", color = "red", size = 3.5, fontface = "bold") +
+  labs(
+    title = "Most Bikes Are Redeployed Within 24 Hours — Few Remain Idle for Days",
+    x = "Time Between Rides (hours)",
+    y = "Count of Interventions",
+    caption = "Source: Derived from Citi Bike September 2019 trip data (interventions dataset)."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+
+
+
+
+```{r}
+# location of spatial polygon data frame to tibble (data.frame) for
+# boroughs and neighborhoods, convert to sf data frame
+
+url <- str_c(
+    'https://ssp3nc3r.github.io/',
+    '20213APAN5800K007/data/betanyc_hoods.geojson'
+    )
+
+nyc_neighborhoods <- read_sf(url)
+```
+
+
+
+```{r}
+p_hoods <- 
+  
+  # initialize graph
+  ggplot() + 
+  
+  # remove most non-data ink
+  theme_void() +
+  
+  # add color for water (behind land polygons)
+  theme(
+    panel.background = element_rect(fill = 'lightblue')
+  ) +
+  
+  # map boundary data to visual elements (polygons)
+  geom_sf(
+    data = nyc_neighborhoods,
+    mapping = aes(geometry = geometry),
+    fill = 'white',
+    color = 'gray',
+    lwd = 0.1
+  ) +
+  
+  # define coordinate system and zoom in on Manhattan
+  coord_sf(
+    crs = sf::st_crs(4326), # World Geodetic System 1984 (WGS84)
+    xlim = c(-74.03, -73.91),
+    ylim = c( 40.695, 40.85)
+  )
+
+
+# display the graph
+p_hoods
+```
+
+
+
+```{r}
+library(dplyr)
+
+intervention_removals <- interventions |>
+  group_by(
+    start_station_id,
+    start_station_name,
+    start_station_longitude,
+    start_station_latitude
+  ) |>
+  summarise(num_removed = n(), .groups = "drop")
+
+#double-check it exists and columns are correct
+glimpse(intervention_removals)
+
+#layer onto base map of Manhattan
+p_hoods +
+  geom_point(
+    data = intervention_removals,
+    aes(
+      x = start_station_longitude,
+      y = start_station_latitude,
+      size = num_removed,
+      color = num_removed
+    ),
+    alpha = 0.6,
+    inherit.aes = FALSE   #tells ggplot not to “inherit” the aesthetics from the base map layer (which uses geometry)
+  ) +
+  scale_color_viridis_c(option = "plasma", name = "Removals") +
+  scale_size_continuous(name = "Removals", range = c(1, 7)) +
+  labs(
+    title = "Citi Bike Interventions Are Concentrated Around Midtown and Lower Manhattan",
+    subtitle = "Point size and color indicate frequency of bike removals per station",
+    caption = "Source: Citi Bike September 2019 trip data (interventions dataset)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray30"),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+
+
+```
+
+
+
+
+```{r}
+#convert both tripduration columns to numeric (hours)
+rider_trips <- rider_trips |>
+  mutate(tripduration = as.numeric(tripduration, units = "hours"))
+
+interventions <- interventions |>
+  mutate(tripduration = as.numeric(tripduration))   # already numeric, but keeps consistency
+
+#create allmoves combining 2 datasets
+allmoves <- bind_rows(rider_trips, interventions)
+
+#check to onfirm successful merge
+glimpse(allmoves)
+
+```
+
+
+
+# Estimating number of bikes at stations (data transformation and visual encodings)
+
+
+
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+#create a long-format table of all movements (arrivals and departures)
+all_bike_flows <- allmoves |>
+  #gather the start and end events into one column
+  select(start_time, end_time, start_station_name, end_station_name) |>
+  pivot_longer(
+    cols = c(start_time, end_time),
+    names_to = "event_type",
+    values_to = "time"
+  ) |>
+  mutate(
+    #assign station name depending on whether it’s a start or end
+    station_name = if_else(event_type == "start_time",
+                           start_station_name, end_station_name),
+    #assign +1 for arrivals (end), -1 for departures (start)
+    bike_delta = if_else(event_type == "start_time", -1, 1)
+  ) |>
+  select(time, station_name, bike_delta) |>
+  filter(!is.na(station_name))
+
+#compute cumulative sum per station ordered by time for allmoves dataset
+all_bike_cumsum <- all_bike_flows |>
+  arrange(station_name, time) |>
+  group_by(station_name) |>
+  mutate(cum_bikes = cumsum(bike_delta),
+         adj_cum_bikes = cum_bikes - min(cum_bikes)) |>  # adjust baseline
+  ungroup()
+
+#compute cumulative sum per station ordered by time for interventions dataset
+intervention_flows <- interventions |>
+  select(start_time, end_time, start_station_name, end_station_name) |>
+  pivot_longer(
+    cols = c(start_time, end_time),
+    names_to = "event_type",
+    values_to = "time"
+  ) |>
+  mutate(
+    station_name = if_else(event_type == "start_time",
+                           start_station_name, end_station_name),
+    bike_delta = if_else(event_type == "start_time", -1, 1)
+  ) |>
+  select(time, station_name, bike_delta) |>
+  filter(!is.na(station_name)) |>
+  arrange(station_name, time) |>
+  group_by(station_name) |>
+  mutate(cum_bikes = cumsum(bike_delta),
+         adj_cum_bikes = cum_bikes - min(cum_bikes)) |>
+  ungroup()
+
+```
+
+
+
+
+```{r}
+#filter for  target station
+target_station <- "W 31 St & 7 Ave"
+
+#filter for both datasets for this station
+all_bike_station <- all_bike_cumsum |>
+  filter(station_name == target_station)
+
+intervention_station <- intervention_flows |>
+  filter(station_name == target_station)
+
+#plot the two cumulative sums of all across time together
+library(ggplot2)
+
+ggplot() +
+  geom_line(
+    data = all_bike_station,
+    aes(x = time, y = adj_cum_bikes, color = "All movements"),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = intervention_station,
+    aes(x = time, y = adj_cum_bikes, color = "Interventions only"),
+    linewidth = 0.8
+  ) +
+  scale_color_manual(
+    values = c("All movements" = "black", "Interventions only" = "red")
+  ) +
+  labs(
+    title = "Estimated Citi Bike Availability Over Time — W 31 St & 7 Ave",
+    subtitle = "Black: All rides and interventions | Red: Operational interventions only",
+    x = "Time (September 2019)",
+    y = "Estimated bikes available (normalized)",
+    color = "Legend",
+    caption = "Source: Derived from Citi Bike trip data and intervention estimates"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "top"
+  )
+
+
+
+```
+
+
+
+
+
+```{r}
+library(ggplot2)
+
+ggplot() +
+  geom_line(
+    data = all_bike_station,
+    aes(x = time, y = adj_cum_bikes, color = "All movements"),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = intervention_station,
+    aes(x = time, y = adj_cum_bikes, color = "Interventions only"),
+    linewidth = 0.8
+  ) +
+  #black label and arrow
+  annotate("text",
+           x = as.POSIXct("2019-09-03 12:00:00"),
+           y = 75,
+           label = "Steep declines show heavy rider demand",
+           color = "black", size = 3.5, hjust = 0) +
+  annotate("segment",
+           x = as.POSIXct("2019-09-11 00:00:00"), 
+           xend = as.POSIXct("2019-09-09 18:00:00"),
+           y = 50, yend = 72,
+           arrow = arrow(length = unit(0.15, "cm")), color = "black") +
+  
+  #red label moved to far right and arrow points correctly to it
+  annotate("text",
+           x = as.POSIXct("2019-09-23"),  #label far right
+           y = 70,
+           label = "Red spikes mark Citi Bike’s\nrebalancing actions adding\nbikes after depletion",
+           color = "red", size = 3.5, hjust = 0) +
+  annotate("segment",
+           x = as.POSIXct("2019-09-22"),  #start (red surge area)
+           xend = as.POSIXct("2019-09-27"),  #end (label area)
+           y = 88, yend = 82,  # gentle downward diagonal
+           arrow = arrow(length = unit(0.15, "cm")), color = "red") +
+  
+  scale_color_manual(
+    values = c("All movements" = "black", "Interventions only" = "red")
+  ) +
+  labs(
+    title = "Interventions Follow Rider Demand — W 31 St & 7 Ave",
+    subtitle = "Black shows all activity; red shows when Citi Bike adds or removes bikes to restore balance.",
+    x = "Time (September 2019)",
+    y = "Estimated bikes available (normalized)",
+    color = "Legend",
+    caption = "Source: Derived from Citi Bike trip data and intervention estimates"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "top"
+  )
+
+
+```
+
+
+
+
+
